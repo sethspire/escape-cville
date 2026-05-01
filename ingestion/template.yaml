@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Timeout: 30
+    Environment:
+      Variables:
+        TABLE_NAME: escape-cville-table
+        REGION: us-east-1
+
+Resources:
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      DockerTag: latest
+      DockerContext: ./ingest
+      Dockerfile: Dockerfile
+    Properties:
+      FunctionName: escape-cville-ingest
+      PackageType: Image 
+      ImageUri: ingest:latest 
+      
+      Events:
+        FrequentSchedule:
+          Type: Schedule
+          Properties:
+            Name: ingest-every-15min-daytime
+            Schedule: cron(0/15 10-23 * * ? *) # 6:00am-7:45pm EDT, every 15min
+            Enabled: true
+        InfrequentSchedule:
+          Type: Schedule
+          Properties:
+            Name: ingest-every-30min-overnight
+            Schedule: cron(0/30 0-9 * * ? *) # 8:00pm-5:30am EDT, every 30min
+            Enabled: true
+
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: escape-cville-table
+        - DynamoDBReadPolicy:
+            TableName: escape-cville-table
+        - Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+            Resource: arn:aws:ssm:us-east-1:045511193184:parameter/escape-cville/here-api-key
+
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: "*"
