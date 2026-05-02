@@ -20,17 +20,11 @@ Resources:
       PackageType: Image
       ImageUri: ingestfunction:latest
       Events:
-        FrequentSchedule:
+        IngestSchedule:
           Type: Schedule
           Properties:
-            Name: ingest-every-15min-daytime
-            Schedule: cron(0/15 10-23 * * ? *)
-            Enabled: true
-        InfrequentSchedule:
-          Type: Schedule
-          Properties:
-            Name: ingest-every-30min-overnight
-            Schedule: cron(0/30 0-9 * * ? *)
+            Name: ingest-every-20min
+            Schedule: cron(0/20 * * * ? *)
             Enabled: true
       Policies:
       - DynamoDBWritePolicy:

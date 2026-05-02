@@ -22,18 +22,24 @@ Resources:
       ImageUri: ingest:latest 
       
       Events:
-        FrequentSchedule:
+        IngestSchedule:
           Type: Schedule
           Properties:
-            Name: ingest-every-15min-daytime
-            Schedule: cron(0/15 10-23 * * ? *) # 6:00am-7:45pm EDT, every 15min
+            Name: ingest-every-20min
+            Schedule: cron(0/20 * * * ? *) # every 20min
             Enabled: true
-        InfrequentSchedule:
-          Type: Schedule
-          Properties:
-            Name: ingest-every-30min-overnight
-            Schedule: cron(0/30 0-9 * * ? *) # 8:00pm-5:30am EDT, every 30min
-            Enabled: true
+        # FrequentSchedule:
+        #   Type: Schedule
+        #   Properties:
+        #     Name: ingest-every-15min-daytime
+        #     Schedule: cron(0/15 10-23 * * ? *) # 6:00am-7:45pm EDT, every 15min
+        #     Enabled: true
+        # InfrequentSchedule:
+        #   Type: Schedule
+        #   Properties:
+        #     Name: ingest-every-30min-overnight
+        #     Schedule: cron(0/30 0-9 * * ? *) # 8:00pm-5:30am EDT, every 30min
+        #     Enabled: true
 
       Policies:
         - DynamoDBWritePolicy:
