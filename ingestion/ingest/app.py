@@ -10,8 +10,7 @@ from botocore.exceptions import ClientError
 from glom import glom, PathAccessError
 from decimal import Decimal
 from zoneinfo import ZoneInfo
-from matplotlib import pyplot as plt
-import seaborn as sns
+import numpy as np
 
 # Setup logging
 log = logging.getLogger()
@@ -63,6 +62,9 @@ def handler(event, context) -> dict:
         r4 = update_metadata("south", south_item)
     else:
         r4 = {"statusCode": 500, "body": "south ingestion failed"}
+
+    # update plots
+    update_plots()
 
     max_status_code = max(r1["statusCode"], r2["statusCode"], r3["statusCode"], r4["statusCode"])
     return {"statusCode": max_status_code, "body": f"{r1['body']}\n{r2['body']}\n{r3['body']}\n{r4['body']}"}
@@ -348,12 +350,61 @@ def get_datetime_info(dt: str) -> tuple:
     is_weekend = dt_ec_rounded.day_name().lower() in ["saturday", "sunday"]
     return dt_eastcoast, dt_ec_rounded, hour, is_weekend
 
+
 # Plot Helpers
 def update_plots():
-    pass
+    # update past 24 hour plot
+    try:
+        n_24hr = get_past_24hr("north", shift_to_edt=True)
+        s_24hr = get_past_24hr("south", shift_to_edt=True)
+        if len(n_24hr) == 0 or len(s_24hr) == 0:
+            log.warning("plot_24hr_skipped_no_data")
+            return
+        both = pd.concat([n_24hr, s_24hr], axis=0)
+
+        log.info("Creating 24hr plot")
+
+        fig_24hr = create_recent_plot(both)
+        
+        if fig_24hr is not None:
+            save_fig_to_s3(fig_24hr, "plots/24hr.png")
+            log.info("plot_24hr_saved")
+        else:
+            log.warning("plot_24hr_skipped_no_data")
+
+        log.info("Finished saving 24hr plot")
+    except Exception:
+        log.exception("24hr plot failed")
+
+    # update the aggregation plots
+    try:
+        log.info("Creating weekend aggregation plot")
+        weekend_plot = create_aggregated_plot("we")
+        
+        if weekend_plot is not None:
+            save_fig_to_s3(weekend_plot, "plots/weekend.png")
+            log.info("Saved weekend aggregation plot")
+        else:
+            log.warning("plot_weekend_skipped_no_data")
+    except Exception:
+        log.exception("weekend plot failed")
+
+    try:
+        log.info("Creating weekday aggregation plot")
+        weekday_plot = create_aggregated_plot("wd")
+
+        if weekday_plot is not None:
+            save_fig_to_s3(weekday_plot, "plots/weekday.png")
+            log.info("Saved weekday aggregation plot")
+        else:
+            log.warning("plot_weekday_skipped_no_data")
+    except Exception:
+        log.exception("weekday plot failed")
 
 def create_recent_plot(df):
     """Plot Change in Drive Time over past 24 hours"""
+    from matplotlib import pyplot as plt
+    import seaborn as sns
     if df.empty or len(df) < 2:
         # log.info("Not enough history to plot yet (%d point(s))", len(df))
         return None
@@ -396,7 +447,7 @@ def create_recent_plot(df):
     ax.legend()
 
     ax.set_title(
-        "Charlottesville Drive Time Past 24 Hours\n"
+        "Charlottesville Drive Time Past 24 Hours Between School of Data Science and 29/64 Interchange\n"
         f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
@@ -404,6 +455,7 @@ def create_recent_plot(df):
     # ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.2f}"))
     ax.set_xlabel("Time (EDT)", labelpad=8)
 
+    plt.rcParams['timezone'] = 'US/Eastern'
     sns.despine(ax=ax, top=True, right=True)
     fig.autofmt_xdate(rotation=25, ha="right")
     import matplotlib.dates as mdates
@@ -413,22 +465,97 @@ def create_recent_plot(df):
 
     return fig
 
+def create_aggregated_plot(day_type=str):
+    """Plot aggregated data: mean/sd for each hour. takes in either 'we' or 'wd' """
+    from matplotlib import pyplot as plt
+    import seaborn as sns
+
+    if day_type not in ["we", "wd"]:
+        raise ValueError("day_type must be either 'we' or 'wd'")
+    long_day_type = "Weekend" if day_type == "we" else "Weekday"
+    
+    # get metadata files
+    north_meta_df = get_s3_csv_file("data/north_metadata.csv")
+    south_meta_df = get_s3_csv_file("data/south_metadata.csv")
+
+    # add sd
+    north_meta_df[f"{day_type}-sd"] = np.where(
+        north_meta_df[f"{day_type}-count"] > 1,
+        (north_meta_df[f"{day_type}-m2"] / (north_meta_df[f"{day_type}-count"] - 1)) ** 0.5,
+        0
+    )
+    south_meta_df[f"{day_type}-sd"] = np.where(
+        south_meta_df[f"{day_type}-count"] > 1,
+        (south_meta_df[f"{day_type}-m2"] / (south_meta_df[f"{day_type}-count"] - 1)) ** 0.5,
+        0
+    )
+
+    # create plot: plot mean across hours with errorbars via 2*sd
+    sns.set_theme(style="darkgrid", context="talk", font_scale=0.9)
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    sns.lineplot(data=north_meta_df, x="hour", y=f"{day_type}-mean", ax=ax, label="North")
+    sns.lineplot(data=south_meta_df, x="hour", y=f"{day_type}-mean", ax=ax, label="South")
+
+    ax.fill_between(north_meta_df["hour"], north_meta_df[f"{day_type}-mean"] - north_meta_df[f"{day_type}-sd"], north_meta_df[f"{day_type}-mean"] + north_meta_df[f"{day_type}-sd"], alpha=0.2)
+    ax.fill_between(south_meta_df["hour"], south_meta_df[f"{day_type}-mean"] - south_meta_df[f"{day_type}-sd"], south_meta_df[f"{day_type}-mean"] + south_meta_df[f"{day_type}-sd"], alpha=0.2)
+
+    # have x ticks every 2 hours
+    ax.set_xticks(north_meta_df["hour"].unique()[::2])
+
+    ax.set_title(f"{long_day_type} Mean Drive Time Across Hours Between School of Data Science and 29/64 Interchange\nLast updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    ax.set_ylabel("Duration (seconds)")
+    ax.set_xlabel("Hour (ET)", labelpad=8)
+    sns.despine(ax=ax, top=True, right=True)
+    fig.autofmt_xdate(rotation=25, ha="right")
+    plt.tight_layout()
+
+    return fig
+
+def get_past_24hr(direction, shift_to_edt=False):
+    # query dynamodb
+    dynamodb = boto3.resource("dynamodb", region_name=REGION)
+    table = dynamodb.Table(TABLE_NAME)
+
+    cur_datetime = datetime.now(timezone.utc)
+    now = cur_datetime.isoformat()
+    start = (cur_datetime - timedelta(days=1)).isoformat()
+
+    resp = table.query(
+        KeyConditionExpression=Key("route").eq(direction) & Key("timestamp").between(start, now),
+        ScanIndexForward=True,   # scending timestamp order
+    )
+
+    # create dataframe
+    items = resp.get("Items", [])
+    df = pd.DataFrame(items)
+
+    df["timestamp"]   = pd.to_datetime(df["timestamp"])
+    df["distance"] = df["distance"].astype(int)
+    df["base_duration"] = df["base_duration"].astype(int) 
+    df["duration"] = df["duration"].astype(int) 
+    df["delta"] = pd.to_numeric(
+        df.get("delta"), errors="coerce"
+    ).fillna(0)
+
+    if shift_to_edt:
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert("America/New_York")
+
+    return df
+
+def save_fig_to_s3(fig, filename):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
     buf.seek(0)
-    plt.close(fig)
-    # log.info("Plot generated (%d bytes, %d points)", len(buf.getvalue()), len(df))
-    return buf
+    s3.put_object(Bucket=BUCKET_NAME, Key=filename, Body=buf.getvalue(), ContentType="image/png")
 
-def create_aggregated_plot():
-    pass
 
 if __name__ == "__main__":
     # temp = get_all_direction("south", return_df=True)
     # print(temp[60:80])
     # print(len(temp))
 
-    print(fetch_data("south"))
-    print(fetch_data("north"))
+     #update_plots()
+     pass
 
     # handler(None, None)
