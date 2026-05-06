@@ -1,3 +1,4 @@
 create_env_vars.sh
 .venv
 data_fixes
+reminders.txt
