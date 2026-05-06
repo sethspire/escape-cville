@@ -13,6 +13,7 @@ Data is sampled every 20 minutes. This is the maximum possible while remaining w
 Metadata is stored in csv files in an S3 bucket that allows for use of Welford's Online Algorithm to get a constant update of the mean and standard deviation of the duration. This is aggregated into separate files for the North route and South route. Within each file, there is a row for each hour (0-23) with columns separating between weekdays and weekends.
 
 ### Chalice API Resources
+(https://7d2bpuav0e.execute-api.us-east-1.amazonaws.com/api/)
 
 - `/` : Displays the "about" information and lists the other resources
 - `/current` : returns the most recent north and south drive times
