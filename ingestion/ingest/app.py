@@ -1,67 +1,92 @@
 import os
+import io
 import logging
 import requests
+import pandas as pd
 import boto3
 from boto3.dynamodb.conditions import Key
 from datetime import datetime, timezone, timedelta
 from botocore.exceptions import ClientError
 from glom import glom, PathAccessError
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
-# setup logging
+# Setup logging
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 TABLE_NAME = os.environ.get("TABLE_NAME", "escape-cville-table")
 REGION = os.environ.get("REGION", "us-east-1")
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "escape-cville-bucket")
+
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+s3 = boto3.client("s3", region_name=REGION)
+ssm = boto3.client("ssm", region_name=REGION)
+table = dynamodb.Table(TABLE_NAME)
 
 # Get API key from SSM
+HERE_API_KEY = None
 def get_api_key():
-    ssm = boto3.client("ssm", region_name="us-east-1")
+    global HERE_API_KEY
+    if HERE_API_KEY:
+        return HERE_API_KEY
+
     try:
         response = ssm.get_parameter(
             Name="/escape-cville/here-api-key",
             WithDecryption=True
         )
-    except Exception as e:
-        log.error("Failed to fetch api key from SSM: %s", e)
-        quit()
-    return response["Parameter"]["Value"]
-HERE_API_KEY = get_api_key()
+        HERE_API_KEY = response["Parameter"]["Value"]
+        return HERE_API_KEY
+    except ClientError as e:
+        log.exception("SSM get_parameter failed")
+        raise
 
 
-def handler(event, context):
-    """Called by CloudWatch scheduler, every 15 or 30 minutes."""
+# Handler
+def handler(event, context) -> dict:
+    """Called by CloudWatch scheduler, every 20 minutes. Returns status code and body."""
 
     # ingest north and south
     check_time = datetime.now(timezone.utc).isoformat()
-    r1 = ingest("north", check_time)
-    r2 = ingest("south", check_time)
+    r1, north_item = ingest("north", check_time)
+    r2, south_item = ingest("south", check_time)
 
-    max_status_code = max(r1["statusCode"], r2["statusCode"])
-    return {"statusCode": max_status_code, "body": f"{r1['body']}\n{r2['body']}"}
+    # update metadata
+    if north_item:
+        r3 = update_metadata("north", north_item)
+    else:
+        r3 = {"statusCode": 500, "body": "north ingestion failed"}
+    if south_item:
+        r4 = update_metadata("south", south_item)
+    else:
+        r4 = {"statusCode": 500, "body": "south ingestion failed"}
+
+    max_status_code = max(r1["statusCode"], r2["statusCode"], r3["statusCode"], r4["statusCode"])
+    return {"statusCode": max_status_code, "body": f"{r1['body']}\n{r2['body']}\n{r3['body']}\n{r4['body']}"}
 
 
-def ingest(direction, check_time):
-    """Runs ingestion for a direction."""
-    log.info(f"Starting ingestion run: {direction}")
+# Ingestion Helpers
+def ingest(direction, check_time)  -> dict:
+    """Runs ingestion for a direction. Time is preset. Returns status code and body dict and item dict if successful."""
+    log.info("Starting ingestion run direction=%s", direction)
 
     # Fetch data
     try:
         data = fetch_data(direction)
     except Exception as e:
-        log.error("Failed to fetch data: %s", e)
-        return {"statusCode": 500, "body": str(e)}
+        log.exception("Failed to fetch data")
+        return {"statusCode": 500, "body": f"{direction} ingestion failed: {e}"}, None
     
     # Get previous item
     try:
         previous_item = get_previous(direction)
     except ClientError as e:
+        log.error("Client Error:Failed to get previous item: %s", e)
+        return {"statusCode": 500, "body": f"{direction} ingestion failed: {e}"}, None
+    except Exception as e:
         log.error("Failed to get previous item: %s", e)
-        return {"statusCode": 500, "body": str(e)}
-    except PathAccessError as e:
-        log.error("Failed to get previous item: %s", e)
-        return {"statusCode": 500, "body": str(e)}
+        return {"statusCode": 500, "body": f"{direction} ingestion failed: {e}"}, None
     
     # Calculate delta
     if previous_item is None:
@@ -81,18 +106,16 @@ def ingest(direction, check_time):
 
     try:
         write_to_dynamo(item)
-    except Exception as e:
-        log.error("Failed to write to DynamoDB: %s", e)
-        return {"statusCode": 500, "body": str(e)}
+    except ClientError as e:
+        log.exception("DynamoDB write failed")
+        return {"statusCode": 500, "body": f"{direction} ingestion failed: {e}"}, None
 
     log.info("Wrote item: %s", item)
-    return {"statusCode": 200, "body": "ok"}
+    return {"statusCode": 200, "body": f"Successfully wrote item: {item}"}, item
 
-
-def fetch_data(direction):
-    """Fetches from HERE API; Return all data."""
-    if HERE_API_KEY is None:
-        raise ValueError("HERE_API_KEY is not set")
+def fetch_data(direction) -> dict:
+    """Fetches from HERE API; Returns duration, base_duration, distance."""
+    api_key = HERE_API_KEY or get_api_key() # raises if fails
 
     if direction == "south": # SDS to 29/64
         origin = "38.0405308,-78.5079088"
@@ -110,17 +133,38 @@ def fetch_data(direction):
         "destination": destination,
         "routingMode": "fast",
         "return": "summary",
-        "apikey": HERE_API_KEY
+        "apikey": api_key
     }
-    response = requests.get(url, params=params)
 
-    response.raise_for_status()
-    data = response.json()
+    response = None
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+    except requests.HTTPError:
+        log.error(
+            "HERE API HTTP error: status=%s body=%s",
+            response.status_code if response else "N/A",
+            response.text if response else "N/A"
+        )
+        raise
+    except requests.RequestException:
+        log.exception("HERE API request failed")
+        raise
+
+    try:
+        data = response.json()
+    except ValueError:
+        log.error("Failed to parse HERE API response as JSON: %s", response.text)
+        raise
 
     # see if needed key/values exist
-    duration = glom(data, "routes.0.sections.0.summary.duration")
-    base_duration = glom(data, "routes.0.sections.0.summary.baseDuration")
-    distance = glom(data, "routes.0.sections.0.summary.length")
+    try:
+        duration = glom(data, "routes.0.sections.0.summary.duration")
+        base_duration = glom(data, "routes.0.sections.0.summary.baseDuration")
+        distance = glom(data, "routes.0.sections.0.summary.length")
+    except PathAccessError:
+        log.error("HERE API response missing expected fields: %s", data)
+        raise
 
     return {
         "duration": duration,
@@ -128,12 +172,8 @@ def fetch_data(direction):
         "distance": distance
     }
 
-
-def get_previous(direction):
-    """Return the latest stored item for the given direction."""
-    dynamodb = boto3.resource("dynamodb", region_name=REGION)
-    table = dynamodb.Table(TABLE_NAME)
-
+def get_previous(direction) -> dict:
+    """Return the latest stored item for the given direction from DynamoDB."""
     resp = table.query(
         KeyConditionExpression=Key("route").eq(direction),
         ScanIndexForward=False,   # descending timestamp order
@@ -143,14 +183,170 @@ def get_previous(direction):
     items = resp.get("Items", [])
     return items[0] if items else None
 
-
 def write_to_dynamo(item):
     """Write the item to DynamoDB."""
-    dynamodb = boto3.resource("dynamodb", region_name=REGION)
-    table = dynamodb.Table(TABLE_NAME)
     table.put_item(Item=item)
 
 
+# MetaData Helpers
+def update_metadata(direction, item) -> dict:
+    """Runner for updating metadata. Returns status code and body."""
+    log.info("Starting metadata update run direction=%s", direction)
+
+    try:
+        # check if file exists in s3
+        meta_df = get_s3_csv_file(f"data/{direction}_metadata.csv") # returns None if file doesn't exist
+
+        # if not, do cold start
+        if meta_df is None:
+            new_meta_df = cold_start_meta(direction)
+
+        # otherwise, update single item
+        else:
+            new_meta_df = meta_update_item(meta_df, item)
+
+    except Exception:
+        log.exception("Metadata DF update failed for direction=%s", direction)
+        return {"statusCode": 500, "body": "metadata DF update failed"}
+
+    # save to s3
+    try:
+        save_s3_csv_file(new_meta_df, f"data/{direction}_metadata.csv")
+    except Exception:
+        log.exception("Metadata update failed save to s3 for direction=%s", direction)
+        return {"statusCode": 500, "body": "metadata update failed save to s3"}
+
+    log.info("Finished metadata update run direction=%s", direction)
+    return {"statusCode": 200, "body": f"Successfully updated metadata for {direction}"}
+
+def meta_update_item(meta_df, item) -> pd.DataFrame:
+    """Update metadata for a single item using Welford's algorithm. Returns updated df."""
+
+    # get hour and is_weekend in east coast time zone (round to nearest hour)
+    dt_eastcoast = pd.to_datetime(item["timestamp"]).tz_convert("America/New_York")
+    dt_ec_rounded = dt_eastcoast.round("1h")
+    hour = dt_ec_rounded.hour
+    is_weekend = dt_ec_rounded.day_name().lower() in ["saturday", "sunday"]
+
+    # get weekday/weekend suffix and index for hour
+    suffix = "we" if is_weekend else "wd"
+    matches = meta_df.index[meta_df["hour"] == hour]
+    if len(matches) == 0:
+        raise ValueError(f"No row found for hour={hour}")
+    idx = matches[0]
+
+    # get current mean, count, m2; get new value
+    n = meta_df.at[idx, f"{suffix}-count"]
+    mean = meta_df.at[idx, f"{suffix}-mean"]
+    m2 = meta_df.at[idx, f"{suffix}-m2"]
+    x = float(item["duration"])
+
+    # update using Welford's algorithm
+    n += 1
+    delta = x - mean
+    mean_new = mean + delta / n
+    delta2 = x - mean_new
+    m2_new = m2 + delta * delta2
+
+    # update df
+    meta_df.at[idx, f"{suffix}-count"] = n
+    meta_df.at[idx, f"{suffix}-mean"] = mean_new
+    meta_df.at[idx, f"{suffix}-m2"] = m2_new
+    
+    return meta_df
+
+def cold_start_meta(direction) -> pd.DataFrame:
+    """Run cold start for the given direction. Loads all the data in DynamoDB to incrementally run update_item. Returns new meta df."""
+    log.info("Running cold start for direction=%s", direction)
+
+    # create new df with needed columns
+    meta_df = pd.DataFrame({
+        "hour": range(24),
+        "wd-mean": 0.0,
+        "wd-count": 0,
+        "wd-m2": 0.0,
+        "we-mean": 0.0,
+        "we-count": 0,
+        "we-m2": 0.0,
+    })
+
+    # get all data for direction
+    data = get_all_direction(direction)
+
+    # iterate through data, passing to update_item
+    for item in data:
+        meta_df = meta_update_item(meta_df, item)
+
+    return meta_df
+
+def get_all_direction(direction, return_df=False) -> dict | pd.DataFrame:
+    """Return all stored items for the given direction from DynamoDB."""
+
+    items = []
+    last_key = None
+
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("route").eq(direction),
+            "ScanIndexForward": True,
+        }
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
+
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+    if return_df:
+        df = pd.DataFrame(items)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["dt_eastern"] = df["timestamp"].dt.tz_convert("America/New_York")
+
+        # 20 minute features
+        df["dow_20m"] = df["dt_eastern"].dt.day_name()
+        df["is_weekend_20m"] = df["dow_20m"].isin(["Saturday", "Sunday"])
+        df["hhmm_20m"] = df["dt_eastern"].dt.round("20min").dt.strftime("%H:%M")
+
+        # 1 hour features
+        temp = df["dt_eastern"].dt.round("1h")
+        df["dow_1h"] = temp.dt.day_name()
+        df["is_weekend_1h"] = df["dow_1h"].isin(["Saturday", "Sunday"])
+        df["hour_1h"] = temp.dt.round("1h").dt.hour
+        return df
+    
+    # if not return dataframe
+    return items
+
+def get_s3_csv_file(file_name) -> pd.DataFrame | None:
+    """Return pandas dataframe from S3, or None if file does not exist."""
+
+    try:
+        obj = s3.get_object(Bucket=BUCKET_NAME, Key=file_name)
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        raise  # re-raise anything else (permissions, etc.)
+
+    data = obj["Body"].read().decode("utf-8")
+    df = pd.read_csv(io.StringIO(data))
+    return df
+
+def save_s3_csv_file(df, file_name):
+    """Save pandas dataframe to S3."""
+    
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    s3.put_object(Bucket=BUCKET_NAME, Key=file_name, Body=csv_buffer.getvalue())
+
+
 if __name__ == "__main__":
-    pass
+    # temp = get_all_direction("south", return_df=True)
+    # print(temp[60:80])
+    # print(len(temp))
+
+    print(get_all_direction("south", return_df=True))
+
     # handler(None, None)

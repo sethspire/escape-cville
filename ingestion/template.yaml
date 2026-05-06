@@ -8,6 +8,7 @@ Globals:
       Variables:
         TABLE_NAME: escape-cville-table
         REGION: us-east-1
+        S3_BUCKET: escape-cville-bucket
 
 Resources:
   IngestFunction:
@@ -47,12 +48,25 @@ Resources:
         - DynamoDBReadPolicy:
             TableName: escape-cville-table
         - Statement:
+          # Allow access to SSM and KMS
           - Effect: Allow
             Action:
               - ssm:GetParameter
             Resource: arn:aws:ssm:us-east-1:045511193184:parameter/escape-cville/here-api-key
-
           - Effect: Allow
             Action:
               - kms:Decrypt
             Resource: "*"
+          
+          # Allow access to S3
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - arn:aws:s3:::escape-cville-bucket/*
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - arn:aws:s3:::escape-cville-bucket
