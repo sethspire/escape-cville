@@ -20,6 +20,10 @@ Resources:
       FunctionName: escape-cville-ingest
       PackageType: Image
       ImageUri: ingestfunction:latest
+      MemorySize: 300
+      Environment:
+        Variables:
+          MPLCONFIGDIR: /tmp/matplotlib
       Events:
         IngestSchedule:
           Type: Schedule
