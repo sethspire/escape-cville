@@ -10,6 +10,8 @@ from botocore.exceptions import ClientError
 from glom import glom, PathAccessError
 from decimal import Decimal
 from zoneinfo import ZoneInfo
+from matplotlib import pyplot as plt
+import seaborn as sns
 
 # Setup logging
 log = logging.getLogger()
@@ -223,10 +225,7 @@ def meta_update_item(meta_df, item) -> pd.DataFrame:
     """Update metadata for a single item using Welford's algorithm. Returns updated df."""
 
     # get hour and is_weekend in east coast time zone (round to nearest hour)
-    dt_eastcoast = pd.to_datetime(item["timestamp"]).tz_convert("America/New_York")
-    dt_ec_rounded = dt_eastcoast.round("1h")
-    hour = dt_ec_rounded.hour
-    is_weekend = dt_ec_rounded.day_name().lower() in ["saturday", "sunday"]
+    dt_eastcoast, dt_ec_rounded, hour, is_weekend = get_datetime_info(item["timestamp"])
 
     # get weekday/weekend suffix and index for hour
     suffix = "we" if is_weekend else "wd"
@@ -341,12 +340,95 @@ def save_s3_csv_file(df, file_name):
     df.to_csv(csv_buffer, index=False)
     s3.put_object(Bucket=BUCKET_NAME, Key=file_name, Body=csv_buffer.getvalue())
 
+def get_datetime_info(dt: str) -> tuple:
+    """Return datetime info for the given datetime string. (dt_eastcoast, dt_ec_rounded, hour, is_weekend)"""
+    dt_eastcoast = pd.to_datetime(dt).tz_convert("America/New_York")
+    dt_ec_rounded = dt_eastcoast.round("1h")
+    hour = dt_ec_rounded.hour
+    is_weekend = dt_ec_rounded.day_name().lower() in ["saturday", "sunday"]
+    return dt_eastcoast, dt_ec_rounded, hour, is_weekend
+
+# Plot Helpers
+def update_plots():
+    pass
+
+def create_recent_plot(df):
+    """Plot Change in Drive Time over past 24 hours"""
+    if df.empty or len(df) < 2:
+        # log.info("Not enough history to plot yet (%d point(s))", len(df))
+        return None
+
+    sns.set_theme(style="darkgrid", context="talk", font_scale=0.9)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # price
+    sns.lineplot(data=df, x="timestamp", y="duration", ax=ax, hue="route", linewidth=2.5, zorder=2)
+
+    # # highlight spikes
+    # if "trend" in df.columns:
+    #     upspikes = df[df["trend"].isin(["SPIKE_UP"])]
+    #     downspikes = df[df["trend"].isin(["SPIKE_DOWN"])]
+    # else:
+    #     upspikes = pd.DataFrame()
+    #     downspikes = pd.DataFrame()
+    # if not upspikes.empty:
+    #     ax.scatter(
+    #         upspikes["timestamp"],
+    #         upspikes["price_usd"],
+    #         s=120,
+    #         marker="^",
+    #         color="red",
+    #         label="Spike Up (> $2)",
+    #         zorder=5
+    #     )
+    # if not downspikes.empty:
+    #     ax.scatter(
+    #         downspikes["timestamp"],
+    #         downspikes["price_usd"],
+    #         s=120,
+    #         marker="v",
+    #         color="green",
+    #         label="Spike Down (< -$2)",
+    #         zorder=5
+    #     )
+
+    ax.legend()
+
+    ax.set_title(
+        "Charlottesville Drive Time Past 24 Hours\n"
+        f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+
+    ax.set_ylabel("Duration (seconds)")
+    # ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.2f}"))
+    ax.set_xlabel("Time (EDT)", labelpad=8)
+
+    sns.despine(ax=ax, top=True, right=True)
+    fig.autofmt_xdate(rotation=25, ha="right")
+    import matplotlib.dates as mdates
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+    plt.tight_layout()
+
+    return fig
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    # log.info("Plot generated (%d bytes, %d points)", len(buf.getvalue()), len(df))
+    return buf
+
+def create_aggregated_plot():
+    pass
 
 if __name__ == "__main__":
     # temp = get_all_direction("south", return_df=True)
     # print(temp[60:80])
     # print(len(temp))
 
-    print(get_all_direction("south", return_df=True))
+    print(fetch_data("south"))
+    print(fetch_data("north"))
 
     # handler(None, None)

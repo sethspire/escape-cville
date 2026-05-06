@@ -1,3 +1,6 @@
 boto3
 glom
 requests
+pandas
+seaborn
+matplotlib

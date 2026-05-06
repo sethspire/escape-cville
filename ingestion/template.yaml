@@ -70,3 +70,4 @@ Resources:
               - s3:ListBucket
             Resource:
               - arn:aws:s3:::escape-cville-bucket
+              

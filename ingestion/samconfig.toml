@@ -12,3 +12,4 @@ image_repositories = ["IngestFunction=045511193184.dkr.ecr.us-east-1.amazonaws.c
 
 [default.global.parameters]
 region = "us-east-1"
+
