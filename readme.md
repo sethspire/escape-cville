@@ -9,17 +9,13 @@ This project uses the HERE Api to get the drive time between the School of Data 
 
 ## Architecture
 
-HERE Routing API
-        ↓
-EventBridge
-        ↓
-Dockerized AWS Lambda
-        ↓
-DynamoDB ──────→ Chalice REST API
-        ↓
-Online Statistics
-        ↓
-S3 Plots / Aggregates
+EventBridge Cron Job  
+        **↓**  
+Dockerized AWS Lambda **⇄** HERE Routing API  
+        **↓**  
+DynamoDB **+** S3 (Plots / Aggregates)  
+        **⇅**  
+Chalice REST API
 
 ## Data
 Data is sampled every 20 minutes. This is the maximum possible while remaining within the free tier for the API. It is stored in a DynamoDB using the keys `route` (south or north) and `timestamp` (UTC datetime) while storing the data for the trip: `duration` (seconds to reach destination), `base_duration` (seconds for that trip with zero traffic), `distance` (meters traveled for the trip), and `delta` (the change is seconds of the duration since the last sample).
